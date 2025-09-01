@@ -168,10 +168,11 @@ if run:
         net.add_edge(u, v, value=val, title=title, width=1+val)
 
     html_path = "graph.html"
-    net.show(html_path)
+    net.write_html(html_path)   # show() 대신 write_html()
     with open(html_path, "r", encoding="utf-8") as f:
         html = f.read()
     components.html(html, height=640, scrolling=True)
+
 
     st.success("완료!")
 
