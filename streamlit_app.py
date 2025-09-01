@@ -1,180 +1,170 @@
 # -*- coding: utf-8 -*-
-# 실행: streamlit run streamlit_app.py --server.port 8501 --server.address 0.0.0.0
-import os, re, itertools, time
-from typing import List, Set, Dict
+import os, re
 import streamlit as st
-import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 import networkx as nx
-from pyvis.network import Network
-import kss
-import streamlit.components.v1 as components
+import plotly.graph_objects as go
 
-# =============================
-# 기본 설정
-# =============================
-st.set_page_config(page_title="소설 인물 관계 네트워크", page_icon="📚", layout="wide")
-st.title("📚 소설 인물 관계 네트워크 — 차미 / 오란 / 녹주")
+# ========= Pretendard 폰트 (repo 내 fonts/Pretendard-Bold.ttf) =========
+FONT_PATH = "fonts/Pretendard-Bold.ttf"
+if os.path.exists(FONT_PATH):
+    fm.fontManager.addfont(FONT_PATH)
+plt.rc("font", family="Pretendard")
+plt.rcParams["axes.unicode_minus"] = False
+
+st.set_page_config(page_title="인물 관계 곡선 + 네트워크", layout="wide", page_icon="📖")
+st.title("📖 인물 관계 시각화: 곡선 + 네트워크 (Plotly)")
+
+# ========= 조사 허용 정규식(이름 인식) =========
+JOSA_GENERAL = (
+    r"(?:이|가|은|는|을|를|과|와|랑|이랑|하고|도|만|부터|까지|에게|한테|께|께서|에서|으로|로|의|야|아|여)?"
+)
+# '나'는 '나가다' 오탐 방지 위해 '가' 제외
+JOSA_FOR_NA = (
+    r"(?:은|는|을|를|과|와|랑|이랑|하고|도|만|부터|까지|에게|한테|께|께서|에서|으로|로|의|야|아|여)?"
+)
+
+def whole_word_korean(name: str, josa_pat: str) -> re.Pattern:
+    return re.compile(
+        rf"(^|[^가-힣A-Za-z0-9_]){re.escape(name)}{josa_pat}($|[^가-힣A-Za-z0-9_])"
+    )
+
+PAT = {
+    "차미": whole_word_korean("차미", JOSA_GENERAL),
+    "오란": whole_word_korean("오란", JOSA_GENERAL),
+    "나":   whole_word_korean("나",   JOSA_FOR_NA),
+}
+
+# ========= 문장 분리 =========
+def split_sentences(text: str):
+    parts = re.split(r"[.?!;]+|\n+", text)
+    return [p.strip() for p in parts if p and p.strip()]
+
+def has(name: str, s: str) -> bool:
+    return PAT[name].search(s) is not None
+
+# ========= 분석: 곡선 + 네트워크 가중치 =========
+PAIRS = [("차미", "오란"), ("나", "차미"), ("나", "오란")]
+
+def analyze_all(text: str):
+    sents = split_sentences(text)
+    # 누적 곡선용
+    score = {f"{a}-{b}": 0 for a, b in PAIRS}
+    timeline = []
+    # 네트워크 가중치(총 동시 등장 횟수)
+    weights = {(a, b): 0 for a, b in PAIRS}
+
+    for i, s in enumerate(sents, start=1):
+        present = {n: has(n, s) for n in ["나", "차미", "오란"]}
+        for a, b in PAIRS:
+            if present[a] and present[b]:
+                score[f"{a}-{b}"] += 1
+                weights[(a, b)] += 1
+        timeline.append((i, score.copy()))
+    return timeline, weights
+
+# ========= 곡선 시각화 (matplotlib) =========
+def plot_curves(timeline):
+    if not timeline:
+        return
+    x = [i for i, _ in timeline]
+    series = {k: [t[1][k] for t in timeline] for k in timeline[-1][1].keys()}
+
+    fig = plt.figure(figsize=(9, 5))
+    for k, y in series.items():
+        plt.plot(x, y, marker="o", linewidth=2, label=k)
+    plt.title("인물 관계 친밀도 흐름 (문장 동시 등장 누적)")
+    plt.xlabel("소설 진행 (문장 순서)")
+    plt.ylabel("친밀도 점수")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    st.pyplot(fig)
+
+# ========= 네트워크 시각화 (Plotly) =========
+def plot_network(weights: dict, min_weight: int = 1, seed: int = 42):
+    # NetworkX 그래프
+    G = nx.Graph()
+    for n in ["나", "차미", "오란"]:
+        G.add_node(n)
+
+    for (a, b), w in weights.items():
+        if w >= min_weight:
+            G.add_edge(a, b, weight=w)
+
+    # 배치 (고정 시드로 재현성)
+    pos = nx.spring_layout(G, seed=seed, k=1.2)
+
+    # 엣지 선(각 엣지를 별도 trace로 두께 반영)
+    edge_traces = []
+    for (u, v, data) in G.edges(data=True):
+        x0, y0 = pos[u]; x1, y1 = pos[v]
+        w = data.get("weight", 1)
+        edge_traces.append(
+            go.Scatter(
+                x=[x0, x1], y=[y0, y1],
+                mode="lines",
+                line=dict(width=1 + 2*w),
+                hoverinfo="text",
+                text=[f"{u}–{v}: {w}", f"{u}–{v}: {w}"],
+                showlegend=False,
+            )
+        )
+
+    # 노드 점
+    strengths = {}
+    for n in G.nodes():
+        strengths[n] = sum(G[n][nbr]["weight"] for nbr in G.neighbors(n)) if G.degree(n) > 0 else 0
+
+    node_x = [pos[n][0] for n in G.nodes()]
+    node_y = [pos[n][1] for n in G.nodes()]
+    node_size = [20 + 10*strengths[n] for n in G.nodes()]
+    node_text = [f"{n} (연결강도: {strengths[n]})" for n in G.nodes()]
+    node_color_map = {"나": "#6C5CE7", "차미": "#00B894", "오란": "#0984E3"}
+    node_color = [node_color_map.get(n, "#3498DB") for n in G.nodes()]
+
+    node_trace = go.Scatter(
+        x=node_x, y=node_y,
+        mode="markers+text",
+        text=[n for n in G.nodes()],
+        textposition="top center",
+        hoverinfo="text",
+        hovertext=node_text,
+        marker=dict(size=node_size, line=dict(width=1), color=node_color),
+        showlegend=False,
+    )
+
+    fig = go.Figure(data=edge_traces + [node_trace])
+    fig.update_layout(
+        width=900, height=560,
+        margin=dict(l=10, r=10, t=40, b=10),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        title="관계 네트워크 (동시 등장 가중치)",
+    )
+
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+sample_text = """나와 차미는 오늘 처음으로 오란을 만났다. 차미가 오란과 오래 이야기했다!
+다음 날, 나는 차미와 다시 만났고 오란도 잠깐 합류했다.
+점심시간에 나와 오란은 우연히 마주쳤다. 저녁에는 차미와 오란이 또 함께 있었다.
+밤이 되어 나와 차미, 오란까지 셋이서 메시지를 주고받았다."""
 
 with st.sidebar:
-    st.header("옵션")
-    st.caption("등장 인물은 고정: 차미, 오란, 녹주")
-    window = st.slider("동시출현 윈도우(문장 단위)", 1, 3, 1)
-    min_edge = st.slider("엣지 가중치 임계값", 1, 5, 1)
+    st.subheader("옵션")
+    min_w = st.slider("네트워크: 엣지 최소 가중치", 1, 5, 1, 1)
+    seed = st.number_input("레이아웃 시드", value=42, step=1)
 
-SAMPLE = """오늘을 얼마나 기다렸는지 모른다. 차미는 가방을 여미고 오란을 기다렸다.
-오란은 늦게 도착했고, 녹주는 두 사람을 멀리서 바라보았다.
-차미와 녹주는 짧게 인사를 나누고, 오란은 미안하다고 말했다.
-그날 이후 차미와 오란, 녹주의 관계는 조금씩 달라졌다."""
-text = st.text_area("소설 본문 붙여넣기", value=SAMPLE, height=220)
-uploaded = st.file_uploader("또는 .txt 업로드", type=["txt"])
-if uploaded:
-    text = uploaded.read().decode("utf-8", errors="ignore")
+text = st.text_area("소설 텍스트 입력", sample_text, height=240)
 
-run = st.button("분석 실행")
+if st.button("분석하기"):
+    timeline, weights = analyze_all(text)
 
-# =============================
-# 유틸 함수
-# =============================
-NAMES = ["차미", "오란", "녹주"]
-NAME_RX = re.compile(r"(차미|오란|녹주)(씨|님|군|양|선생님?)?")
+    st.subheader("관계 곡선")
+    plot_curves(timeline)
 
-def normalize_name(s: str) -> str:
-    s = s.strip()
-    s = re.sub(r"(씨|님|군|양|선생님?)$", "", s)
-    return s
+    st.subheader("관계 네트워크")
+    plot_network(weights, min_weight=min_w, seed=seed)
 
-def split_sentences(t: str) -> List[str]:
-    return [s.strip() for s in kss.split_sentences(t) if s.strip()]
-
-def sentence_window_indices(i: int, w: int, n: int) -> List[int]:
-    if w <= 1:
-        return [i]
-    idxs = {i}
-    for k in range(1, w):
-        if i-k >= 0: idxs.add(i-k)
-        if i+k < n: idxs.add(i+k)
-    return sorted(idxs)
-
-# =============================
-# 실행
-# =============================
-if run:
-    if not text.strip():
-        st.warning("본문을 입력해주세요.")
-        st.stop()
-
-    sentences = split_sentences(text)
-    st.write(f"문장 수: {len(sentences)}")
-
-    # 문장별 등장 인물 집합
-    per_by_sent: List[Set[str]] = []
-    for s in sentences:
-        found = set(normalize_name(m.group(1)) for m in NAME_RX.finditer(s))
-        found = {n for n in found if n in NAMES}
-        per_by_sent.append(found)
-
-    # 그래프 생성
-    G = nx.Graph()
-    freq: Dict[str, int] = {n: 0 for n in NAMES}
-
-    n = len(per_by_sent)
-    for i in range(n):
-        idxs = sentence_window_indices(i, window, n)
-        people = set().union(*[per_by_sent[j] for j in idxs])
-        for p in people:
-            freq[p] += 1
-            if p not in G:
-                G.add_node(p)
-        for a, b in itertools.combinations(sorted(list(people)), 2):
-            if G.has_edge(a, b):
-                G[a][b]["weight"] += 1
-            else:
-                G.add_edge(a, b, weight=1)
-
-    # 엣지 필터
-    to_remove = [(u, v) for u, v, d in G.edges(data=True) if d.get("weight", 0) < min_edge]
-    G.remove_edges_from(to_remove)
-
-    # =============================
-    # 요약 테이블 생성
-    # =============================
-    nodes_df = pd.DataFrame([
-        {"name": nname,
-         "degree": G.degree(nname),
-         "frequency": freq.get(nname, 0)}
-        for nname in G.nodes()
-    ])
-    if not nodes_df.empty:
-        nodes_df = nodes_df.sort_values(["degree", "frequency"], ascending=[False, False])
-
-    edges_data = [
-        {"source": u, "target": v, "weight": d.get("weight", 0)}
-        for u, v, d in G.edges(data=True)
-    ]
-    edges_df = pd.DataFrame(edges_data)
-    if not edges_df.empty:
-        edges_df = edges_df.sort_values("weight", ascending=False)
-
-    # =============================
-    # Streamlit 출력
-    # =============================
-    col1, col2 = st.columns([1, 1])
-
-    with col1:
-        st.subheader("노드 요약")
-        if nodes_df.empty:
-            st.info("⚠️ 노드가 없습니다. 인물이 등장하지 않았습니다.")
-        else:
-            st.dataframe(nodes_df, use_container_width=True, height=260)
-            st.download_button(
-                "노드 CSV 다운로드",
-                nodes_df.to_csv(index=False).encode("utf-8"),
-                file_name="nodes.csv",
-                mime="text/csv"
-            )
-
-    with col2:
-        st.subheader("엣지 요약")
-        if edges_df.empty:
-            st.info("⚠️ 엣지가 없습니다. 인물들이 같은 문장에 함께 등장하지 않았습니다.")
-        else:
-            st.dataframe(edges_df, use_container_width=True, height=260)
-            st.download_button(
-                "엣지 CSV 다운로드",
-                edges_df.to_csv(index=False).encode("utf-8"),
-                file_name="edges.csv",
-                mime="text/csv"
-            )
-
-    # =============================
-    # 네트워크 시각화 (Pyvis)
-    # =============================
-    st.subheader("관계 네트워크 (드래그/줌 가능)")
-    net = Network(height="620px", width="100%", bgcolor="#ffffff", font_color="#222222")
-    net.barnes_hut(gravity=-20000, central_gravity=0.3, spring_length=160, spring_strength=0.005, damping=0.6)
-
-    # 노드 추가
-    fmax = max(1, max(freq.values()))
-    for n in NAMES:
-        if n in G.nodes:
-            size = 20 + 30 * (freq[n] / fmax)
-            label = f"{n} (deg={G.degree(n)}, f={freq[n]})"
-            net.add_node(n, label=label, title=label, size=float(size))
-
-    # 엣지 추가
-    for u, v, d in G.edges(data=True):
-        val = int(d.get("weight", 1))
-        title = f"{u}–{v} (w={val})"
-        net.add_edge(u, v, value=val, title=title, width=1+val)
-
-    html_path = "graph.html"
-    net.write_html(html_path)   # show() 대신 write_html()
-    with open(html_path, "r", encoding="utf-8") as f:
-        html = f.read()
-    components.html(html, height=640, scrolling=True)
-
-
-    st.success("완료!")
-
-st.markdown("---")
-st.caption("고정 인물: 차미 · 오란 · 녹주 | 문장 동시출현 기반 관계망")
